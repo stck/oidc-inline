@@ -27,6 +27,7 @@ type Config struct {
 	Password   string `yaml:"password"`
 	TOTPSecret string `yaml:"totp_secret"`
 	Socks5     string `yaml:"socks5"`
+	LogFile    string `yaml:"log_file"`
 }
 
 type Challenge struct {
@@ -106,6 +107,15 @@ func main() {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("Config error: %v", err)
+	}
+
+	if cfg.LogFile != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("Failed to open log file: %v", err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
 	}
 
 	log.Printf("Starting OIDC flow executor (config: %s)", configPath)
@@ -210,6 +220,61 @@ func resolveRedirect(currentURL string, location string) (string, error) {
 	return base.ResolveReference(ref).String(), nil
 }
 
+// resolveDeviceCodeURL checks if the URL is a device code flow page
+// (e.g. /oauth2/device?user_code=XXXX). If so, it POSTs the user_code
+// to the verify endpoint and returns the redirect URL that starts the
+// normal OIDC auth chain. Otherwise returns the URL unchanged.
+func resolveDeviceCodeURL(client *http.Client, browserURL string) (string, error) {
+	u, err := url.Parse(browserURL)
+	if err != nil {
+		return browserURL, nil
+	}
+
+	userCode := u.Query().Get("user_code")
+	if userCode == "" || !strings.Contains(u.Path, "/oauth2/device") {
+		return browserURL, nil
+	}
+
+	log.Printf("Detected device code flow, submitting user_code: %s", userCode)
+
+	verifyURL := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, strings.TrimSuffix(u.Path, "/")+"/auth/verify_code")
+
+	noRedirectClient := &http.Client{
+		Jar:       client.Jar,
+		Timeout:   client.Timeout,
+		Transport: client.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	formData := url.Values{"user_code": {userCode}}
+	resp, err := noRedirectClient.PostForm(verifyURL, formData)
+	if err != nil {
+		return "", fmt.Errorf("post device code to %s: %w", verifyURL, err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			return "", fmt.Errorf("device verify returned redirect with no Location")
+		}
+		resolved, err := resolveRedirect(verifyURL, location)
+		if err != nil {
+			return "", fmt.Errorf("resolve device verify redirect: %w", err)
+		}
+		log.Printf("Device code verified, redirecting to: %s", resolved)
+		return resolved, nil
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		return "", fmt.Errorf("device code verify returned 200 (code may be invalid or expired)")
+	}
+
+	return "", fmt.Errorf("device code verify unexpected status: %d", resp.StatusCode)
+}
+
 func runFlow(cfg *Config, browserURL string) error {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -241,6 +306,12 @@ func runFlow(cfg *Config, browserURL string) error {
 	}
 
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
+
+	// Handle device code flow: POST the user_code to verify endpoint to start the redirect chain.
+	browserURL, err = resolveDeviceCodeURL(client, browserURL)
+	if err != nil {
+		return fmt.Errorf("device code resolution: %w", err)
+	}
 
 	// Step 1: Follow the redirect chain from the browser URL to discover
 	// which flow authentik wants us to execute and what query params to use.

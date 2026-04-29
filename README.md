@@ -33,6 +33,7 @@ username: user@example.com
 password: your-password
 totp_secret: YOUR_TOTP_SECRET_BASE32
 socks5: socks5://user:pass@proxy:1080  # optional
+log_file: /var/log/oidc-inline.log     # optional
 ```
 
 | Field | Required | Description |
@@ -42,6 +43,7 @@ socks5: socks5://user:pass@proxy:1080  # optional
 | `password` | Yes | Account password |
 | `totp_secret` | Yes | Base32-encoded TOTP secret for 2FA |
 | `socks5` | No | SOCKS5 proxy URL (localhost traffic bypasses proxy) |
+| `log_file` | No | Path to log file (defaults to stderr if not set) |
 
 ## Usage
 
