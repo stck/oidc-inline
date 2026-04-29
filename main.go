@@ -26,6 +26,7 @@ type Config struct {
 	Username   string `yaml:"username"`
 	Password   string `yaml:"password"`
 	TOTPSecret string `yaml:"totp_secret"`
+	Socks5     string `yaml:"socks5"`
 }
 
 type Challenge struct {
@@ -210,12 +211,28 @@ func runFlow(cfg *Config, browserURL string) error {
 		return fmt.Errorf("create cookie jar: %w", err)
 	}
 
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+	}
+
+	if cfg.Socks5 != "" {
+		proxyURL, err := url.Parse(cfg.Socks5)
+		if err != nil {
+			return fmt.Errorf("parse socks5 url: %w", err)
+		}
+		transport.Proxy = func(req *http.Request) (*url.URL, error) {
+			if isLocalhost(req.URL.Host) {
+				return nil, nil
+			}
+			return proxyURL, nil
+		}
+		log.Printf("Using SOCKS5 proxy: %s", cfg.Socks5)
+	}
+
 	client := &http.Client{
-		Jar:     jar,
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
-		},
+		Jar:       jar,
+		Timeout:   30 * time.Second,
+		Transport: transport,
 	}
 
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
@@ -470,16 +487,8 @@ func followRedirectsToCompletion(client *http.Client, startURL string, cfg *Conf
 }
 
 func deliverCode(client *http.Client, redirectURL string) error {
-	u, err := url.Parse(redirectURL)
-	if err != nil {
-		return fmt.Errorf("parse final redirect url: %w", err)
-	}
+	log.Printf("Following callback chain from: %s", redirectURL)
 
-	code := u.Query().Get("code")
-	state := u.Query().Get("state")
-	log.Printf("Obtained authorization code: %s (state: %s)", code, state)
-
-	// Deliver the code to the local callback (e.g. http://localhost:53000)
 	noRedirectClient := &http.Client{
 		Jar:       client.Jar,
 		Timeout:   client.Timeout,
@@ -489,26 +498,54 @@ func deliverCode(client *http.Client, redirectURL string) error {
 		},
 	}
 
-	resp, err := noRedirectClient.Get(redirectURL)
-	if err != nil {
-		// Connection refused is OK if the local server already shut down
-		if strings.Contains(err.Error(), "connection refused") {
-			log.Printf("Local callback not reachable (connection refused), but code was obtained")
-			fmt.Printf("code=%s\nstate=%s\n", code, state)
+	currentURL := redirectURL
+	for i := 0; i < 10; i++ {
+		resp, err := noRedirectClient.Get(currentURL)
+		if err != nil {
+			if strings.Contains(err.Error(), "connection refused") {
+				u, _ := url.Parse(currentURL)
+				if u != nil && isLocalhost(u.Host) {
+					log.Printf("Local callback not reachable, but code was delivered to: %s", currentURL)
+					fmt.Printf("code=%s\nstate=%s\n", u.Query().Get("code"), u.Query().Get("state"))
+					return nil
+				}
+			}
+			return fmt.Errorf("callback request to %s: %w", currentURL, err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location := resp.Header.Get("Location")
+			if location == "" {
+				return fmt.Errorf("redirect with no Location at %s", currentURL)
+			}
+			nextURL, err := resolveRedirect(currentURL, location)
+			if err != nil {
+				return fmt.Errorf("resolve callback redirect: %w", err)
+			}
+			log.Printf("Callback redirect: %s", nextURL)
+			currentURL = nextURL
+			continue
+		}
+
+		u, _ := url.Parse(currentURL)
+		if u != nil && u.Query().Get("code") != "" {
+			log.Printf("Code delivered to callback: %s (status %d)", currentURL, resp.StatusCode)
+			fmt.Println("Success: Authorization code delivered to redirect_uri")
 			return nil
 		}
-		return fmt.Errorf("deliver code to callback: %w", err)
-	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	log.Printf("Code delivered to callback, status: %d", resp.StatusCode)
-	if len(body) > 0 && len(body) < 500 {
-		log.Printf("Callback response: %s", string(body))
+		log.Printf("Callback chain ended at %s (status %d)", currentURL, resp.StatusCode)
+		fmt.Println("Success: Callback chain completed")
+		return nil
 	}
 
-	fmt.Println("Success: Authorization code delivered to redirect_uri")
-	return nil
+	return fmt.Errorf("exceeded max redirects in callback chain")
+}
+
+func isLocalhost(host string) bool {
+	h := strings.Split(host, ":")[0]
+	return h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]"
 }
 
 func getChallenge(client *http.Client, urlStr string) (*Challenge, error) {
