@@ -73,7 +73,12 @@ func findConfigPath(provided string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no config.yaml found in current directory or next to binary; provide --config flag")
+	etcConfig := "/etc/oidc-inline/config.yaml"
+	if _, err := os.Stat(etcConfig); err == nil {
+		return etcConfig, nil
+	}
+
+	return "", fmt.Errorf("no config.yaml found in current directory, next to binary, or /etc/oidc-inline; provide --config flag")
 }
 
 func generateTOTP(secret string) (string, error) {
