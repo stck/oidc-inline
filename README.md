@@ -61,7 +61,7 @@ netbird up
 
 ## Docker
 
-The published Docker image is based on `ghcr.io/11notes/netbird-client:0.70` with `oidc-inline` pre-installed at `/etc/oidc-inline` and `BROWSER` env set accordingly.
+The published Docker image is based on https://github.com/11notes/docker-netbird-client with `oidc-inline` pre-installed at `/etc/oidc-inline` and `BROWSER` env set accordingly.
 
 ```bash
 docker pull ghcr.io/stck/oidc-inline:latest
