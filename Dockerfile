@@ -5,6 +5,6 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/oidc-inline main.go
 
-FROM ghcr.io/11notes/netbird-client:0.73
+FROM ghcr.io/11notes/netbird-client:0.74
 COPY --from=build /out/oidc-inline /usr/local/bin/oidc-inline
 ENV BROWSER=/usr/local/bin/oidc-inline
