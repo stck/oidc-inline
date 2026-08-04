@@ -1,0 +1,267 @@
+name: Bump netbird-client
+
+# Periodically checks 11notes/netbird-client for a newer minor version, opens a
+# bump PR, merges it (action-created PRs only), cuts a release tag, and publishes.
+#
+# Repo settings required (Settings → Actions → General):
+#   - "Read and write permissions"
+#   - "Allow GitHub Actions to create and approve pull requests"
+#
+# Optional: protect master so only github-actions[bot] can merge (or require this
+# workflow's merge path). This workflow never auto-merges human PRs.
+
+on:
+  schedule:
+    # Four times daily
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Check for a newer version without opening/merging a PR
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: bump-netbird
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_bump: ${{ steps.compare.outputs.should_bump }}
+      current: ${{ steps.compare.outputs.current }}
+      latest_minor: ${{ steps.compare.outputs.latest_minor }}
+      latest_full: ${{ steps.compare.outputs.latest_full }}
+      branch: ${{ steps.compare.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve current and upstream versions
+        id: compare
+        run: |
+          set -euo pipefail
+
+          current="$(grep -Eo 'netbird-client:[0-9]+(\.[0-9]+)*' Dockerfile | head -n1 | cut -d: -f2)"
+          if [[ -z "${current}" ]]; then
+            echo "Could not parse netbird-client version from Dockerfile" >&2
+            exit 1
+          fi
+
+          latest_full="$(curl -fsSL https://raw.githubusercontent.com/11notes/docker-netbird-client/master/.json \
+            | jq -r '.semver.version')"
+          if [[ ! "${latest_full}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected upstream version: ${latest_full}" >&2
+            exit 1
+          fi
+
+          # Match historical pins: ghcr.io/11notes/netbird-client:X.Y
+          latest_minor="$(echo "${latest_full}" | cut -d. -f1,2)"
+
+          printf 'current=%s\n' "${current}" >> "$GITHUB_OUTPUT"
+          printf 'latest_full=%s\n' "${latest_full}" >> "$GITHUB_OUTPUT"
+          printf 'latest_minor=%s\n' "${latest_minor}" >> "$GITHUB_OUTPUT"
+          printf 'branch=chore/bump-netbird-client-%s\n' "${latest_minor}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$(printf '%s\n%s\n' "${current}" "${latest_minor}" | sort -V | tail -n1)" != "${current}" \
+                && "${current}" != "${latest_minor}" ]]; then
+            echo "should_bump=true" >> "$GITHUB_OUTPUT"
+            echo "Bump available: ${current} -> ${latest_minor} (upstream ${latest_full})"
+          else
+            echo "should_bump=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date at ${current} (upstream ${latest_full})"
+          fi
+
+  bump:
+    needs: check
+    if: needs.check.outputs.should_bump == 'true' && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release_version.outputs.release_tag }}
+      previous_tag: ${{ steps.release_version.outputs.previous_tag }}
+      merged: ${{ steps.merge.outputs.merged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create or update bump branch
+        env:
+          LATEST_MINOR: ${{ needs.check.outputs.latest_minor }}
+          BRANCH: ${{ needs.check.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin master
+          git checkout -B "${BRANCH}" origin/master
+          sed -i -E "s|(ghcr\\.io/11notes/netbird-client:)[0-9]+(\\.[0-9]+)*|\\1${LATEST_MINOR}|" Dockerfile
+          if git diff --quiet Dockerfile; then
+            echo "Dockerfile already on ${LATEST_MINOR}"
+            exit 0
+          fi
+          git add Dockerfile
+          git commit -m "bump netbird-client ${LATEST_MINOR}"
+          git push -u origin "${BRANCH}" --force-with-lease
+
+      - name: Open pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ needs.check.outputs.current }}
+          LATEST_MINOR: ${{ needs.check.outputs.latest_minor }}
+          LATEST_FULL: ${{ needs.check.outputs.latest_full }}
+          BRANCH: ${{ needs.check.outputs.branch }}
+        run: |
+          set -euo pipefail
+          existing="$(gh pr list --head "${BRANCH}" --base master --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "${existing}" ]]; then
+            echo "number=${existing}" >> "$GITHUB_OUTPUT"
+            echo "Reusing open PR #${existing}"
+            exit 0
+          fi
+
+          body="## Automated netbird-client bump
+
+          - Current pin: \`${CURRENT}\`
+          - New pin: \`${LATEST_MINOR}\` (upstream \`${LATEST_FULL}\`)
+          - Source: https://github.com/11notes/docker-netbird-client
+
+          This PR is opened and merged by GitHub Actions only."
+          body="$(printf '%s\n' "${body}" | sed 's/^          //')"
+
+          gh label create dependencies --description "Dependency updates" --color 0366d6 --force >/dev/null 2>&1 || true
+
+          if ! gh pr create \
+            --base master \
+            --head "${BRANCH}" \
+            --title "bump netbird-client ${LATEST_MINOR}" \
+            --body "${body}" \
+            --label "dependencies"; then
+            gh pr create \
+              --base master \
+              --head "${BRANCH}" \
+              --title "bump netbird-client ${LATEST_MINOR}" \
+              --body "${body}"
+          fi
+
+          pr_number="$(gh pr list --head "${BRANCH}" --base master --state open --json number --jq '.[0].number')"
+          echo "number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "Opened PR #${pr_number}"
+
+      - name: Merge pull request (actions only)
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          BRANCH: ${{ needs.check.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          author="$(gh pr view "${PR_NUMBER}" --json author --jq '.author.login')"
+          head_ref="$(gh pr view "${PR_NUMBER}" --json headRefName --jq '.headRefName')"
+          files="$(gh pr view "${PR_NUMBER}" --json files --jq '[.files[].path] | sort | join(",")')"
+
+          if [[ "${author}" != "github-actions[bot]" && "${author}" != "github-actions" ]]; then
+            echo "Refusing to merge PR #${PR_NUMBER}: author is '${author}', not github-actions[bot]" >&2
+            exit 1
+          fi
+
+          if [[ "${head_ref}" != "${BRANCH}" ]]; then
+            echo "Refusing to merge PR #${PR_NUMBER}: unexpected head '${head_ref}'" >&2
+            exit 1
+          fi
+
+          if [[ "${files}" != "Dockerfile" ]]; then
+            echo "Refusing to merge PR #${PR_NUMBER}: expected only Dockerfile, got '${files}'" >&2
+            exit 1
+          fi
+
+          # Prefer merge commit to mirror prior bump history; fall back to squash.
+          if ! gh pr merge "${PR_NUMBER}" --merge --delete-branch; then
+            gh pr merge "${PR_NUMBER}" --squash --delete-branch
+          fi
+
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "Merged PR #${PR_NUMBER}"
+
+      - name: Compute next release tag
+        id: release_version
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          git fetch origin master --tags
+          previous="$(git tag -l 'v*' | sort -V | tail -n1)"
+          if [[ -z "${previous}" ]]; then
+            previous="v0.0.0"
+          fi
+          major="$(echo "${previous#v}" | cut -d. -f1)"
+          minor="$(echo "${previous#v}" | cut -d. -f2)"
+          next_minor=$((minor + 1))
+          release_tag="v${major}.${next_minor}.0"
+          printf 'previous_tag=%s\n' "${previous}" >> "$GITHUB_OUTPUT"
+          printf 'release_tag=%s\n' "${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "Next release: ${release_tag} (after ${previous})"
+
+  release:
+    needs: [check, bump]
+    if: needs.bump.outputs.merged == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ needs.bump.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Create release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.bump.outputs.release_tag }}
+          PREVIOUS_TAG: ${{ needs.bump.outputs.previous_tag }}
+          LATEST_MINOR: ${{ needs.check.outputs.latest_minor }}
+        run: |
+          set -euo pipefail
+          git fetch origin master --tags
+          git checkout master
+          git reset --hard origin/master
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git rev-parse "${RELEASE_TAG}" >/dev/null 2>&1; then
+            git tag -a "${RELEASE_TAG}" -m "bump netbird-client ${LATEST_MINOR}"
+            git push origin "${RELEASE_TAG}"
+          else
+            echo "Tag ${RELEASE_TAG} already exists"
+          fi
+
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            body="$(printf 'Bump netbird-client %s\n\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "${LATEST_MINOR}" "${GITHUB_REPOSITORY}" "${PREVIOUS_TAG}" "${RELEASE_TAG}")"
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "${body}"
+          else
+            echo "Release ${RELEASE_TAG} already exists"
+          fi
+
+  publish:
+    needs: [bump, release]
+    if: needs.bump.outputs.merged == 'true'
+    uses: ./.github/workflows/publish.yml
+    with:
+      ref: ${{ needs.bump.outputs.release_tag }}
+      release_tag: ${{ needs.bump.outputs.release_tag }}
+      latest: true
+    secrets: inherit
