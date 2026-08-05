@@ -54,7 +54,7 @@ jobs:
             type=ref,event=branch,enable=${{ github.event_name == 'push' }}
             type=semver,pattern={{version}},enable=${{ github.event_name == 'push' }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' }}
-            type=raw,value=latest,enable=${{ inputs.latest }}
+            type=raw,value=latest,enable=${{ inputs.latest == true }}
             type=semver,pattern={{version}},value=${{ inputs.release_tag }},enable=${{ inputs.release_tag != '' }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_tag }},enable=${{ inputs.release_tag != '' }}
 
