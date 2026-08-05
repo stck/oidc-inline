@@ -171,7 +171,7 @@ jobs:
           head_ref="$(gh pr view "${PR_NUMBER}" --json headRefName --jq '.headRefName')"
           files="$(gh pr view "${PR_NUMBER}" --json files --jq '[.files[].path] | sort | join(",")')"
 
-          if [[ "${author}" != "github-actions[bot]" && "${author}" != "github-actions" ]]; then
+          if [[ "${author}" != "app/github-actions" ]]; then
             echo "Refusing to merge PR #${PR_NUMBER}: author is '${author}', not github-actions[bot]" >&2
             exit 1
           fi
